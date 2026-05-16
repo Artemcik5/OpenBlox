@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Optional
 
 import requests
@@ -9,13 +10,9 @@ ENDPOINT = f"{GATEWAY_URL}/chat/completions"
 MODELS_ENDPOINT = f"{GATEWAY_URL}/models"
 DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
 ADVANCED_REVIEW_PROMPT = (
-    "You are an expert code reviewer. Review the assistant's last response and output an IMPROVED version. "
-    "Rules:\n"
-    "- Fix any bugs, edge cases, or missing error handling\n"
-    "- If there's a checklist/plan, verify each step is addressed\n"
-    "- Remove any repetition or unnecessary commentary\n"
-    "- Keep the same intent but make it more complete\n"
-    "- Output ONLY the improved response, no review notes, no commentary"
+    "Internal review step: improve the assistant's most recent draft. "
+    "Fix mistakes, remove repetition, keep the same user intent, and return one final answer only. "
+    "Do not greet again. Do not restart the conversation. Do not mention this review step."
 )
 
 ROBLOX_SYSTEM = (
@@ -28,13 +25,10 @@ ROBLOX_SYSTEM = (
     "- Use your training knowledge to answer.\n"
     "TOOLBOX SEARCH: Results are pre-filtered by quality (likes + recency). You'll see the top 3 matches. Pick based on description. If the first result's description matches, use it.\n"
     "- RESPONSE LENGTH LIMIT: Maximum 80 lines per response. Hard limit.\n"
-    "- For large tasks: output the full plan as a checklist, then execute ONE part per response.\n"
     "- NEVER output more than 80 lines. If a script is longer, split it into parts.\n"
     "- Show only key parts of very long scripts: \"... [middle section omitted] ...\"\n"
-    "- Always prefer multiple short responses over one long one.\n"
     "- If you hit the limit, stop cleanly and say 'Continuing in next response'.\n"
-    "\n"
-    "COMMENTS: Only add comments to code when something is genuinely non-obvious. Do NOT comment every line. No -- explanation of what the next line does. Comments should be rare and only for tricky logic.\n"
+    "- NEVER output checklists, numbered lists, bullet lists, todo lists, plan summaries, or any kind of multi-item list in your response. Just respond conversationally in plain paragraphs.\n"
     "\n"
     "FORMATTING - CRITICAL: You MUST use proper formatting ALWAYS.\n"
     "  - Code blocks: ALWAYS wrap ALL scripts and code in ```lua ... ```\n"
@@ -63,32 +57,15 @@ ROBLOX_SYSTEM = (
     "  - If you're told \"Context compacted\", older messages were summarized to save space.\n"
     "  - You can call the compact_context tool to summarize old messages when needed.\n"
     "  - Keep responses concise to avoid filling the context.\n"
-    "\n"
-    "CHAIN OF THOUGHT - You have a maximum of 4 reasoning steps.\n"
-    "  - Step 1: \"Thinking: ...\" - analyze the problem\n"
-    "  - Steps 2-3: \"Continuing: ...\" - work through the solution\n"
-    "  - Step 4: \"Final: ...\" - output the answer. This MUST be your last step.\n"
-    "  - Plan ahead: if you can't finish in 4 steps, output a checklist for the next round.\n"
-    "  - On step 4, remind yourself: this is the last step. Wrap up cleanly.\n"
-    "\n"
-    "CHECKLIST SYSTEM - CRITICAL: You maintain a shared checklist visible as a panel.\n"
-    "  - For any multi-step task, ALWAYS first output a numbered plan.\n"
-    "  - Use the format: 1. Step one\\n2. Step two\\n3. Step three (without spaces after numbers)\n"
-    "  - The plan appears in a checklist panel immediately. The user sees it as a collapsible list.\n"
-    "  - As you complete each step, mark it [DONE] in your response so the panel updates.\n"
-    "  - Your next thinking round will see the [DONE] markers and know what's finished.\n"
-    "  - Stick to the original plan. Only add new steps if absolutely necessary.\n"
-    "  - At the end of each response, briefly restate the checklist with updated [DONE] markers.\n"
-    "\n"
-    "MCP TOOL USAGE - CRITICAL HONESTY RULES:\n"
-    "  - Only claim you did something if you ACTUALLY called a tool. Never pretend.\n"
-    "  - If you output code in a ``` block, you did NOT use MCP - just say you wrote the code.\n"
-    "  - When Integration is not active, just write code with ``` formatting - no tool claims.\n"
-    "  - Tool call results are automatically logged above. You don't need to repeat them.\n"
+
+    "MCP TOOL USAGE - CRITICAL RULES:\n"
+    "  - When Roblox Integration is active, ALWAYS write scripts DIRECTLY to Studio via MCP tools. Do NOT output script code in chat.\n"
+    "  - Only describe what you did in a single sentence. Do not show the code in chat.\n"
+    "  - If you output code in a ``` block, you did NOT use MCP - that means you just wrote the code in chat. This is WRONG when Integration is active.\n"
+    "  - When Integration is NOT active, just write code with ``` formatting - no tool claims.\n"
+    "  - Tool call results are automatically logged. You don't need to repeat them.\n"
     "  - NEVER say \"creating...\" or \"I've created\" unless a tool just returned success.\n"
-    "  - After a tool succeeds, just mark the step [DONE] and move on. Don't narrate it again.\n"
     "  - If a tool fails, say it failed. Don't pretend it worked.\n"
-    "  - Be honest: if you can't do something, say so directly.\n"
     "\n"
     "GAME EXPLORATION - When Integration is active, ALWAYS explore first:\n"
     "  - Before writing any code that references existing objects, use MCP to read the game\n"
@@ -124,6 +101,10 @@ class OpenBloxClient:
         self.user_context = user_context
         self.session = requests.Session()
 
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        return max(1, len(text) // 4) if text else 0
+
     def is_configured(self) -> bool:
         return bool(self.api_key)
 
@@ -145,21 +126,16 @@ class OpenBloxClient:
         if not text:
             return False
         normalized = " ".join(text.lower().split())
-        # Skip very short responses
-        if len(normalized) < 80:
-            return False
-        # Skip pure greetings
-        greetings = [
+        generic_prefixes = [
             "hello! i'm your roblox studio expert assistant.",
+            "hello! i’m your roblox studio expert assistant.",
             "hello! i'm here to help with roblox studio",
+            "hello! i’m here to help with roblox studio",
             "what would you like to work on in roblox studio today?",
-            "pong", "hi there", "hello",
         ]
-        for g in greetings:
-            if normalized.startswith(g) or normalized.strip() == g:
-                return False
-        # Skip if it looks like the review already ran
-        if "i reviewed" in normalized or "review the assistant" in normalized:
+        if any(normalized.startswith(prefix) for prefix in generic_prefixes):
+            return False
+        if len(normalized) < 100 and "roblox studio" in normalized:
             return False
         return True
 
@@ -180,8 +156,6 @@ class OpenBloxClient:
         return texts[0][:200] if texts else ""
 
     def _request_review(self, full: list, payload: dict, content: str, tools: list | None):
-        # Save original content to compare after review
-        self._pre_review_content = content
         full.append({"role": "assistant", "content": content})
         full.append({"role": "system", "content": ADVANCED_REVIEW_PROMPT})
         payload["messages"] = full
@@ -195,11 +169,8 @@ class OpenBloxClient:
         tools: list,
         tool_handler,
         advanced_thinking: bool = False,
-        chain_of_thought: bool = False,
     ) -> str:
         max_rounds = 15
-        max_chain = 5
-        chain_count = 0
         content = ""
         reviewed = False
 
@@ -220,29 +191,16 @@ class OpenBloxClient:
                 new_content = ""
 
             if new_content:
-                if chain_of_thought and not tool_calls and "Final:" in new_content:
-                    content = f"{content}\n\n{new_content}" if content else new_content
-                    break
-                if reviewed:
-                    original = getattr(self, '_pre_review_content', '') or content
-                    content = new_content if len(new_content) > len(original) * 0.7 else original
-                else:
-                    content = f"{content}\n\n{new_content}" if content else new_content
+                content = new_content if reviewed else (f"{content}\n\n{new_content}" if content else new_content)
 
             tool_calls = msg.get("tool_calls")
             if not tool_calls or not tool_handler:
                 if content:
-                    if chain_of_thought:
-                        chain_count += 1
-                        if chain_count >= max_chain:
-                            break
                     if advanced_thinking and not reviewed and self._should_run_advanced_review(content):
                         reviewed = True
                         self._request_review(full, payload, content, tools)
                         continue
-                    if not chain_of_thought:
-                        break
-                    continue
+                    break
                 full.append({"role": "user", "content": "Please provide your response now."})
                 payload["messages"] = full
                 if tools:
@@ -274,7 +232,6 @@ class OpenBloxClient:
         tools: list = None,
         tool_handler=None,
         advanced_thinking: bool = False,
-        chain_of_thought: bool = False,
         integration_name: str = "",
     ) -> Optional[str]:
         if not self.api_key:
@@ -289,7 +246,7 @@ class OpenBloxClient:
         }
         if tools:
             payload["tools"] = tools
-        return self._run_tool_loop(full, payload, tools, tool_handler, advanced_thinking, chain_of_thought)
+        return self._run_tool_loop(full, payload, tools, tool_handler, advanced_thinking)
 
     def chat_stream(
         self,
@@ -299,7 +256,6 @@ class OpenBloxClient:
         tools: list = None,
         tool_handler=None,
         advanced_thinking: bool = False,
-        chain_of_thought: bool = False,
         integration_name: str = "",
     ):
         if not self.api_key:
@@ -318,13 +274,18 @@ class OpenBloxClient:
             payload["tools"] = tools
 
         max_rounds = 15
-        max_chain = 5
-        chain_count = 0
         reviewed = False
         content = ""
+        started_at = time.perf_counter()
+        first_token_ms = None
+        tool_calls_count = 0
+        rounds = 0
 
         for _ in range(max_rounds):
+            rounds += 1
+            round_started_at = time.perf_counter()
             resp = self._send_payload(payload)
+            round_latency_ms = round((time.perf_counter() - round_started_at) * 1000, 1)
             if resp is None:
                 if content:
                     break
@@ -340,27 +301,29 @@ class OpenBloxClient:
                 new_content = ""
 
             if new_content:
-                if reviewed:
-                    original = getattr(self, '_pre_review_content', '') or content
-                    content = new_content if len(new_content) > len(original) * 0.7 else original
-                else:
-                    content = f"{content}\n\n{new_content}" if content else new_content
+                if first_token_ms is None:
+                    first_token_ms = round((time.perf_counter() - started_at) * 1000, 1)
+                content = new_content if reviewed else (f"{content}\n\n{new_content}" if content else new_content)
                 yield {"type": "thinking", "content": new_content}
+                yield {
+                    "type": "metric",
+                    "metric": {
+                        "scope": "round",
+                        "round": rounds,
+                        "latency_ms": round_latency_ms,
+                        "tokens_est": self._estimate_tokens(new_content),
+                        "model": self.model,
+                    },
+                }
 
             tool_calls = msg.get("tool_calls")
             if not tool_calls or not tool_handler:
                 if content:
-                    if chain_of_thought:
-                        chain_count += 1
-                        if chain_count >= max_chain or "Final:" in new_content:
-                            break
                     if advanced_thinking and not reviewed and self._should_run_advanced_review(content):
                         reviewed = True
                         self._request_review(full, payload, content, tools)
                         continue
-                    if not chain_of_thought:
-                        break
-                    continue
+                    break
                 full.append({"role": "user", "content": "Please provide your response now."})
                 payload["messages"] = full
                 if tools:
@@ -368,14 +331,15 @@ class OpenBloxClient:
                 continue
 
             full.append(msg)
+            tool_calls_count += len(tool_calls)
             for tc in tool_calls:
                 fn = tc.get("function", {})
                 name = fn.get("name", "")
-                yield {"type": "tool", "tool": name, "integration": integration_name or "Tool"}
                 try:
                     args = json.loads(fn.get("arguments", "{}"))
                 except json.JSONDecodeError:
                     args = {}
+                yield {"type": "tool", "tool": name, "integration": integration_name or "Tool"}
                 result = tool_handler(name, args)
                 output_text = self._extract_tool_output_text(result)
                 yield {"type": "tool_output", "tool": name, "output": output_text or "Done."}
@@ -385,7 +349,23 @@ class OpenBloxClient:
             if tools:
                 payload["tools"] = tools
 
-        yield {"type": "done", "content": content.strip() if content else "(no response)"}
+        final_content = content.strip() if content else "(no response)"
+        total_ms = round((time.perf_counter() - started_at) * 1000, 1)
+        output_tokens = self._estimate_tokens(final_content)
+        generation_ms = max(total_ms - (first_token_ms or total_ms), 1)
+        yield {
+            "type": "metrics",
+            "metrics": {
+                "model": self.model,
+                "ttft_ms": first_token_ms,
+                "total_ms": total_ms,
+                "output_tokens_est": output_tokens,
+                "tps_est": round(output_tokens / (generation_ms / 1000), 2) if output_tokens else 0.0,
+                "rounds": rounds,
+                "tool_calls": tool_calls_count,
+            },
+        }
+        yield {"type": "done", "content": final_content}
 
     def chat_with_context(
         self,
