@@ -95,6 +95,7 @@ class ConfigUpdate(BaseModel):
     provider: Optional[str] = None
     ollama_endpoint: Optional[str] = None
     openai_endpoint: Optional[str] = None
+    unconfigured: Optional[bool] = None
 
 
 class PlanUpdate(BaseModel):
@@ -191,6 +192,7 @@ async def get_config():
             "provider": wm.openblox_config.get("provider", "kilo"),
             "openai_endpoint": wm.openblox_config.get("openai_endpoint", ""),
             "ollama_endpoint": wm.openblox_config.get("ollama_endpoint", "http://localhost:11434"),
+            "unconfigured": wm.openblox_config.get("unconfigured", True),
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -229,6 +231,8 @@ async def save_config(cfg: ConfigUpdate):
             wm.openblox_config["ollama_endpoint"] = cfg.ollama_endpoint
         if cfg.openai_endpoint is not None:
             wm.openblox_config["openai_endpoint"] = cfg.openai_endpoint
+        if cfg.unconfigured is not None:
+            wm.openblox_config["unconfigured"] = cfg.unconfigured
         wm.save()
         return {"ok": True}
     except Exception as e:

@@ -40,6 +40,7 @@ class WebsiteManager:
             "provider": "kilo",
             "openai_endpoint": "",
             "ollama_endpoint": "http://localhost:11434",
+            "unconfigured": True,
         }
         self.search_config = {
             "max_chunks": 8,
@@ -59,6 +60,8 @@ class WebsiteManager:
             self.websites = [WebsiteEntry(**w) for w in data.get("websites", [])]
             self.openblox_config.update(data.get("openblox", {}))
             self.search_config.update(data.get("search", {}))
+            if "unconfigured" not in data.get("openblox", {}):
+                self.openblox_config["unconfigured"] = False
         except (json.JSONDecodeError, KeyError):
             self._set_defaults()
             self.save()

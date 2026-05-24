@@ -252,6 +252,12 @@ function updateDevPanel() {
 // ─── Init ───
 async function init() {
   try {
+    const cfg = await api('/api/config').catch(() => ({}));
+    if (cfg.unconfigured) {
+      document.getElementById('setup-overlay').classList.remove('hidden');
+      hideSpinner();
+      return;
+    }
     const [sd, md] = await Promise.all([
       api('/api/sessions'),
       api('/api/models').catch(() => ({ models: [], free_models: [] })),
@@ -285,7 +291,6 @@ async function init() {
       renderAgentPlan([]);
     }
     populateModels(md.models || [], md.free_models || []);
-    const cfg = await api('/api/config').catch(() => ({}));
     if (cfg.model) {
       $('#model-picker').value = cfg.model;
       $('#s-model').value = cfg.model;
@@ -1455,6 +1460,51 @@ const PROVIDER_ENDPOINTS = {
   lmstudio: 'http://localhost:1234/v1/chat/completions',
   vllm: 'http://localhost:8000/v1/chat/completions',
 };
+
+function onSetupProviderChange() {
+  const provider = document.getElementById('su-provider').value;
+  document.getElementById('su-apikey-field').style.display = provider === 'ollama' ? 'none' : '';
+  document.getElementById('su-ollama-endpoint-field').style.display = provider === 'ollama' ? '' : 'none';
+  document.getElementById('su-openai-endpoint-field').style.display = provider === 'ollama' || provider === 'kilo' ? 'none' : '';
+  const epField = document.getElementById('su-openai-endpoint');
+  if (epField && PROVIDER_ENDPOINTS[provider]) {
+    epField.value = PROVIDER_ENDPOINTS[provider];
+  }
+}
+
+async function saveSetup() {
+  const btn = document.querySelector('#setup-overlay .btn');
+  const status = document.getElementById('su-status');
+  btn.disabled = true;
+  status.textContent = 'Saving...';
+  const provider = document.getElementById('su-provider').value;
+  const payload = {
+    unconfigured: false,
+    provider: provider,
+    api_key: document.getElementById('su-apikey').value,
+    model: document.getElementById('su-model').value || undefined,
+    dev_mode: document.getElementById('su-dev-mode').checked,
+  };
+  if (provider === 'ollama') {
+    payload.ollama_endpoint = document.getElementById('su-ollama-endpoint').value;
+  } else if (provider !== 'kilo') {
+    const ep = document.getElementById('su-openai-endpoint').value;
+    if (ep) payload.openai_endpoint = ep;
+  }
+  try {
+    const res = await api('/api/config', { method: 'POST', body: payload });
+    if (res.ok) {
+      status.textContent = '';
+      location.reload();
+    } else {
+      status.textContent = 'Save failed';
+      btn.disabled = false;
+    }
+  } catch (e) {
+    status.textContent = 'Error: ' + e.message;
+    btn.disabled = false;
+  }
+}
 
 function onProviderChange() {
   const provider = document.getElementById('s-provider').value;

@@ -134,6 +134,75 @@
   <div class="spinner-text">Loading OpenBlox...</div>
 </div>
 
+<div id="setup-overlay" class="overlay hidden">
+  <div class="modal modal-setup" onclick="event.stopPropagation()">
+    <div class="modal-head">
+      <h2>Welcome to OpenBlox</h2>
+    </div>
+    <div class="modal-body">
+      <p class="setup-intro">Let's get you set up. Choose a provider and enter your API key to start chatting.</p>
+      <div class="field">
+        <label>Provider</label>
+        <select id="su-provider" onchange="onSetupProviderChange()">
+          <option value="openai">OpenAI</option>
+          <option value="kilo">Kilo AI</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="openrouter">OpenRouter</option>
+          <option value="nvidia" selected>NVIDIA NIM</option>
+          <option value="groq">Groq</option>
+          <option value="together">Together AI</option>
+          <option value="fireworks">Fireworks AI</option>
+          <option value="mistral">Mistral AI</option>
+          <option value="xai">xAI Grok</option>
+          <option value="perplexity">Perplexity</option>
+          <option value="cerebras">Cerebras</option>
+          <option value="sambanova">SambaNova</option>
+          <option value="deepinfra">DeepInfra</option>
+          <option value="novita">Novita AI</option>
+          <option value="minimax">MiniMax</option>
+          <option value="ai21">AI21 Labs</option>
+          <option value="moonshot">Moonshot / Kimi</option>
+          <option value="dashscope">Qwen / DashScope</option>
+          <option value="lmstudio">LM Studio (Local)</option>
+          <option value="vllm">vLLM (Local)</option>
+          <option value="ollama">Ollama (Local)</option>
+        </select>
+      </div>
+      <div class="field" id="su-apikey-field">
+        <label>API Key</label>
+        <input type="text" id="su-apikey" class="masked" placeholder="Paste your API token" spellcheck="false" autocomplete="off">
+      </div>
+      <div class="field" id="su-ollama-endpoint-field" style="display:none">
+        <label>Ollama Endpoint</label>
+        <input type="text" id="su-ollama-endpoint" value="http://localhost:11434" spellcheck="false">
+      </div>
+      <div class="field" id="su-openai-endpoint-field" style="display:none">
+        <label>API Endpoint</label>
+        <input type="text" id="su-openai-endpoint" spellcheck="false" placeholder="https://api.openai.com/v1/chat/completions">
+      </div>
+      <div class="field">
+        <label>Model (optional — will auto-detect)</label>
+        <input type="text" id="su-model" placeholder="nvidia/nemotron-3-super-120b-a12b:free" spellcheck="false">
+      </div>
+      <div class="field">
+        <label class="dev-switch">
+          <input type="checkbox" id="su-dev-mode">
+          <span class="switch-track">
+            <span class="switch-knob">
+              <svg viewBox="0 0 24 24" width="9" height="9"><path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4L9 16.2z" fill="currentColor"/></svg>
+            </span>
+          </span>
+          <span class="switch-label">Developer Mode</span>
+        </label>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <span id="su-status" style="font-size:12px;color:var(--text3)"></span>
+      <button class="btn" onclick="saveSetup()">Save &amp; Start</button>
+    </div>
+  </div>
+</div>
+
 <div id="modal-overlay" class="overlay hidden" onclick="closeModal(event)">
   <div class="modal" onclick="event.stopPropagation()">
     <div class="modal-head">
