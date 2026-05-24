@@ -293,6 +293,22 @@ async def rename_session(session_id: str, req: RenameRequest):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/api/sessions/{session_id}/discard-partial")
+async def discard_partial(session_id: str):
+    try:
+        s = _get_session(session_id)
+        if not s:
+            return JSONResponse(404, content={"error": "Not found"})
+        s.processing = False
+        # Remove any trailing assistant messages that may be incomplete
+        while s.messages and s.messages[-1].role == "assistant":
+            s.messages.pop()
+        store.save_session(s)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.get("/api/sessions/{session_id}/export")
 async def export_session(session_id: str):
     try:
@@ -496,6 +512,8 @@ async def chat_stream(req: ChatRequest):
 
     def event_stream():
         nonlocal tool_handler
+        session.processing = True
+        store.save_session(session)
         final_content = "(no response)"
         planner_plan = None
         if req.dev_mode and dev_chunks:
@@ -508,140 +526,14 @@ async def chat_stream(req: ChatRequest):
             }
             yield f"data: {json_mod.dumps(dev_event)}\n\n"
         if not ai_client.is_configured():
+            session.processing = False
+            store.save_session(session)
             err_event = {"type": "error", "content": "API key not configured."}
             yield f"data: {json_mod.dumps(err_event)}\n\n"
             return
-
-        agent_context = ""
-        if st.get("roblox_studio_mcp", False):
-            agent_context = (
-                "Roblox Studio integration is ACTIVE and CONNECTED. "
-                "You MUST use the MCP tools to make ALL edits to the game. "
-                "NEVER output script code in chat — write every script directly to Studio via MCP. "
-                "Describe what you did in one plain sentence without showing code. "
-                "BEFORE creating a new map/place, FIRST use MCP to list existing instances and check if one already exists. "
-                "If a map already exists, do NOT create another. If no map exists, import from the Roblox Marketplace. "
-                "When importing third-party assets or marketplace items, the user will be asked for permission — flag it with a warning."
-            )
-
-        combined_extra = _compose_extra_context(extra, doc_ctx, agent_context)
-        chain_thought = req.chain_thought or advanced
-
-        # Create subagent client if a different model is specified
-        subagent_client = None
-        if req.subagent_model and req.subagent_model != ai_client.model:
-            subagent_client = make_client()
-            subagent_client.model = req.subagent_model
-        else:
-            subagent_client = ai_client
-
-        if req.agent_mode:
-            active_tool_names = [cfg["name"] for tid, cfg in tools_mgr.tool_defs.items() if st.get(tid, False)]
-            # Only build a new plan if there's no existing plan with undone steps
-            has_active_plan = any(not s.get("done") for s in session.agent_plan) if session.agent_plan else False
-            if not has_active_plan:
-                planner_plan = _build_agent_plan(ai_client, history, combined_extra, active_tool_names, req.max_subagents)
-                session.agent_plan = [{"text": step, "done": False} for step in planner_plan["main_steps"]]
-                store.save_session(session)
-                plan_event = {
-                    "type": "agent_plan",
-                    "plan": planner_plan,
-                    "session_plan": session.agent_plan,
-                }
-                yield f"data: {json_mod.dumps(plan_event)}\n\n"
-
-                subagent_notes = []
-                if planner_plan["use_subagents"]:
-                    sub_list = planner_plan["subagents"][:min(req.max_subagents, 3)]
-                    for index, subagent in enumerate(sub_list, start=1):
-                        status_event = {
-                            "type": "agent_status",
-                            "stage": "subagent_start",
-                            "agent": subagent["name"],
-                            "message": subagent["goal"],
-                        }
-                        yield f"data: {json_mod.dumps(status_event)}\n\n"
-                        sub_prompt = (
-                            f"You are subagent {index} in OpenBlox agent mode.\n"
-                            f"Focus only on this goal: {subagent['goal']}\n"
-                            "Return concise findings for the main agent. Do not address the user directly."
-                        )
-                        sub_history = list(history) + [{"role": "user", "content": sub_prompt}]
-                        note = subagent_client.chat(
-                            sub_history,
-                            max_tokens=1200,
-                            extra_context=combined_extra,
-                            tools=openai_tools or None if subagent.get("use_tools") else None,
-                            tool_handler=tool_handler if subagent.get("use_tools") else None,
-                            advanced_thinking=chain_thought,
-                        ) or ""
-                        subagent_notes.append(f"{subagent['name']}:\n{note}")
-                        session.agent_logs.append({
-                            "agent": subagent["name"],
-                            "stage": "subagent_done",
-                            "message": note[:400],
-                        })
-                        done_event = {
-                            "type": "agent_status",
-                            "stage": "subagent_done",
-                            "agent": subagent["name"],
-                            "message": note[:400],
-                        }
-                    yield f"data: {json_mod.dumps(done_event)}\n\n"
-
-                if planner_plan["use_subagents"] and subagent_notes:
-                    combined_extra = _compose_extra_context(
-                        extra,
-                        doc_ctx,
-                        agent_context + "\n\nPlanner summary:\n"
-                        + planner_plan["summary"]
-                        + "\n\nSubagent notes:\n"
-                        + "\n\n".join(subagent_notes),
-                    )
-                else:
-                    combined_extra = _compose_extra_context(
-                        extra,
-                        doc_ctx,
-                        agent_context + "\n\nPlanner summary:\n" + planner_plan["summary"],
-                    )
-
-                main_event = {
-                    "type": "agent_status",
-                    "stage": "main_agent",
-                    "agent": "Main Agent",
-                    "message": "Executing the final plan.",
-                }
-                yield f"data: {json_mod.dumps(main_event)}\n\n"
-                session.agent_logs = [{"agent": "Planner", "stage": "plan", "message": planner_plan.get("summary", "")}]
-
-        # Chain-of-thought reasoning enhancement
-        if chain_thought and req.agent_mode:
-            reasoning_prompt = (
-                "Reason through: intent → info → approach → execute → verify. "
-                "Then give final answer."
-            )
-            # Use a local copy to avoid shadowing the closure variable
-            ctx_history = [dict(m) for m in history]
-            if ctx_history and ctx_history[-1]["role"] == "user":
-                ctx_history[-1]["content"] += f"\n\n{reasoning_prompt}"
-        else:
-            ctx_history = history
-
-        final_content = ""
-        main_error = None
-        for event in ai_client.chat_stream(
-            ctx_history, extra_context=combined_extra,
-            tools=openai_tools or None, tool_handler=tool_handler,
-            advanced_thinking=chain_thought, integration_name=integration_name,
-        ):
-            if event["type"] == "done":
-                final_content = event["content"]
-            if event["type"] == "error":
-                main_error = event["content"]
-            yield f"data: {json_mod.dumps(event)}\n\n"
-
         session.add_message("assistant", main_error or final_content)
         if main_error:
+            session.processing = False
             store.save_session(session)
             sess_event = {"type": "session", "session": session.to_dict()}
             yield f"data: {json_mod.dumps(sess_event)}\n\n"
@@ -699,6 +591,8 @@ async def chat_stream(req: ChatRequest):
                 session.add_message("assistant", final_content)
                 store.save_session(session)
 
+        session.processing = False
+        store.save_session(session)
         sess_event = {
             "type": "session",
             "session": session.to_dict(),

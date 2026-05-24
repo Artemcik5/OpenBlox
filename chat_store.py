@@ -58,6 +58,7 @@ class ChatSession:
         self.agent_plan: list[dict] = []
         self.agent_logs: list[dict] = []
         self.permissions_disabled: bool = False
+        self.processing: bool = False
 
     def add_message(self, role: str, content: str, images: list[str] = None):
         self.messages.append(ChatMessage(role, content, images=images))
@@ -100,6 +101,7 @@ class ChatSession:
             "context_pct": self.context_pct(),
             "context_tokens": self.context_tokens(),
             "context_limit": self.context_limit(),
+            "processing": self.processing,
         }
 
     @classmethod
@@ -114,6 +116,7 @@ class ChatSession:
         s.agent_plan = d.get("agent_plan", [])
         s.agent_logs = d.get("agent_logs", [])
         s.permissions_disabled = d.get("permissions_disabled", False)
+        s.processing = d.get("processing", False)
         return s
 
 

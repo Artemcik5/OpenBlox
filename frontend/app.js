@@ -268,6 +268,16 @@ async function init() {
       const sess = await api('/api/sessions/' + curId).catch(() => null);
       if (sess && sess.messages && sess.messages.length) {
         document.getElementById('messages').innerHTML = sess.messages.map((msg, i) => renderMsg(msg.role, msg.content, i, msg.timestamp)).join('');
+        // Show recovery banner if the AI was interrupted mid-stream
+        if (sess.processing && sess.messages[sess.messages.length - 1].role === 'user') {
+          const banner = document.createElement('div');
+          banner.id = 'recovery-banner';
+          banner.style.cssText = 'display:flex;align-items:center;gap:10px;padding:10px 14px;margin:8px 12px;background:#1a1a2e;border:1px solid #f59e0b;border-radius:8px;font-size:13px;color:#f59e0b';
+          banner.innerHTML = '<span style="flex:1">AI was interrupted mid-response. <b>Discard</b> the partial state to send a new message.</span><button class="btn btn-sm" onclick="discardPartial()">Discard</button>';
+          document.getElementById('messages').appendChild(banner);
+          document.getElementById('send-btn').disabled = true;
+          document.getElementById('chat-input').disabled = true;
+        }
         // Restore agent logs on page load
         if (sess.agent_logs && sess.agent_logs.length) {
           _agentTrace = sess.agent_logs;
@@ -1366,6 +1376,21 @@ async function openSettings() {
 function closeModal(e) {
   if (e && e.target !== document.getElementById('modal-overlay')) return;
   document.getElementById('modal-overlay').classList.add('hidden');
+}
+
+async function discardPartial() {
+  if (!curId) return;
+  try {
+    await api('/api/sessions/' + curId + '/discard-partial', { method: 'POST' });
+    const banner = document.getElementById('recovery-banner');
+    if (banner) banner.remove();
+    document.getElementById('send-btn').disabled = false;
+    document.getElementById('chat-input').disabled = false;
+    document.getElementById('chat-input').focus();
+    toast('Partial state cleared. You can send a new message.', 'ok');
+  } catch (e) {
+    toast('Failed to discard: ' + e.message, 'err');
+  }
 }
 
 document.addEventListener('keydown', e => {
