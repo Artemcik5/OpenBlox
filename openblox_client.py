@@ -161,7 +161,7 @@ class OpenBloxClient:
             resp = self.session.get(models_url, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                raw = data.get("data", [])
+                raw = data.get("data") or data.get("models") or []
                 if raw:
                     return [
                         {"id": m["id"], "name": m["id"], "tier": m["id"]}
