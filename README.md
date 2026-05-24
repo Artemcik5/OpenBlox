@@ -77,6 +77,16 @@ python installer.py --terminal --path "C:\path\to\OpenBlox" --launch
 
 The updater preserves only repo assets that belong in the install folder. User data is stored in AppData, so updating does not depend on keeping local `config.json` or `chats/` inside the repository.
 
+## Uninstalling
+
+Run the uninstaller GUI:
+
+```bash
+python uninstaller.py
+```
+
+Check "Remove all data" to also delete config, chats, and settings from AppData.
+
 ## Data storage
 
 OpenBlox stores user data in AppData:
