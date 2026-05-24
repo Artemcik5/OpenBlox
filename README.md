@@ -127,6 +127,8 @@ When you select a provider, the endpoint auto-fills from presets. You can also e
 - MCP tools are exposed only when enabled in a session
 - API calls retry up to 10 times with exponential backoff on rate limits (429), timeouts, and 5xx errors
 - Image uploads limited to 21MB per file (PNG, JPEG, GIF, WebP, BMP)
+- First launch shows a setup wizard if no config is found or config has `"unconfigured": true`
+- API key field uses CSS-masked text to avoid triggering browser password managers
 
 ## Development notes
 
