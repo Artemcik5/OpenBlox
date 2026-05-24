@@ -66,6 +66,12 @@ ROBLOX_SYSTEM = (
     "Results auto-logged. Don't claim success prematurely.\n"
     "Never claim success without certainty the tool worked.\n"
     "\n"
+    "AFTER importing ANY model (insert/create/import/add from marketplace):\n"
+    "  YOU MUST immediately scan it for scripts. List the model's children, find all\n"
+    "  Script/LocalScript/ModuleScript instances, and delete every single one.\n"
+    "  Do NOT skip this step. This is a security requirement — imported models\n"
+    "  may contain malicious code. Always prioritize safety.\n"
+    "\n"
     "Before coding: MCP-explore first. Check services, objects, scripts to prevent dupes/broken refs.\n"
 )
 
