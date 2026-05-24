@@ -14,6 +14,12 @@ print(f"Open http://localhost:{PORT} in your browser")
 print("Press Ctrl+C to stop the server.\n")
 
 try:
-    subprocess.run([sys.executable, SERVER], cwd=DIR)
+    result = subprocess.run([sys.executable, SERVER], cwd=DIR)
+    if result.returncode != 0:
+        print(f"\nServer exited with code {result.returncode}.")
+        input("\nPress Enter to close this window...")
 except KeyboardInterrupt:
     print("\nServer stopped.")
+except Exception as e:
+    print(f"\nFailed to start: {e}")
+    input("\nPress Enter to close this window...")

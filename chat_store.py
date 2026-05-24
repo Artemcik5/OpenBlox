@@ -17,22 +17,27 @@ LEGACY_DATA_DIR = os.path.join(os.path.dirname(__file__), "chats")
 
 
 class ChatMessage:
-    def __init__(self, role: str, content: str, timestamp: float = 0):
+    def __init__(self, role: str, content: str, timestamp: float = 0, images: list[str] = None):
         self.role = role
         self.content = content
         self.timestamp = timestamp or time.time()
+        self.images = images or []
 
     def to_dict(self) -> dict:
-        return {"role": self.role, "content": self.content, "timestamp": self.timestamp}
+        d = {"role": self.role, "content": self.content, "timestamp": self.timestamp}
+        if self.images:
+            d["images"] = self.images
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "ChatMessage":
-        return cls(d["role"], d["content"], d.get("timestamp", 0))
+        return cls(d["role"], d["content"], d.get("timestamp", 0), d.get("images", []))
 
 
 MODEL_CONTEXTS = {
     "nvidia/nemotron-3-super-120b-a12b:free": 262144,
 }
+OLLAMA_DEFAULT_CONTEXT = 8192
 DEFAULT_CONTEXT = 128000
 
 SYSTEM_PROMPT_TOKENS = 900  # ROBLOX_SYSTEM is ~3400 chars ≈ 850 tokens + overhead
@@ -54,8 +59,8 @@ class ChatSession:
         self.agent_logs: list[dict] = []
         self.permissions_disabled: bool = False
 
-    def add_message(self, role: str, content: str):
-        self.messages.append(ChatMessage(role, content))
+    def add_message(self, role: str, content: str, images: list[str] = None):
+        self.messages.append(ChatMessage(role, content, images=images))
         self.updated = time.time()
 
     def context_tokens(self) -> int:

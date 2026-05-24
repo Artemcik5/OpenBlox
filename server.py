@@ -1,10 +1,9 @@
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
-
+import base64
 import json as json_mod
 import re
 import threading
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -39,6 +38,30 @@ ai_client = OpenBloxClient(
 
 tools_mgr = ToolsManager()
 
+UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+MAX_UPLOAD_SIZE = 21 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
+MIME_MAP = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+
+def _build_msg_dict(msg) -> dict:
+    d = {"role": msg.role}
+    if msg.images:
+        parts = [{"type": "text", "text": msg.content}]
+        for img_name in msg.images:
+            img_path = os.path.join(UPLOAD_DIR, img_name)
+            if os.path.isfile(img_path):
+                with open(img_path, "rb") as f:
+                    ext = os.path.splitext(img_name)[1].lower()
+                    mime = MIME_MAP.get(ext, "image/png")
+                    b64 = base64.b64encode(f.read()).decode()
+                    parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+        d["content"] = parts
+    else:
+        d["content"] = msg.content
+    return d
+
 
 # Permission system: pending requests
 _pending_permissions: dict[str, dict] = {}
@@ -53,6 +76,7 @@ class ChatRequest(BaseModel):
     subagent_model: Optional[str] = ""
     max_subagents: Optional[int] = 2
     chain_thought: Optional[bool] = False
+    images: list[str] = []
 
 
 class ConfigUpdate(BaseModel):
@@ -68,6 +92,9 @@ class ConfigUpdate(BaseModel):
     dev_mode: Optional[bool] = None
     permissions_enabled: Optional[bool] = None
     allowed_tools: Optional[list[str]] = None
+    provider: Optional[str] = None
+    ollama_endpoint: Optional[str] = None
+    openai_endpoint: Optional[str] = None
 
 
 class PlanUpdate(BaseModel):
@@ -112,6 +139,9 @@ def make_client():
         model=wm.openblox_config.get("model", "nvidia/nemotron-3-super-120b-a12b:free"),
         temperature=wm.openblox_config.get("temperature", 0.3),
         user_context=ctx,
+        provider=wm.openblox_config.get("provider", "kilo"),
+        openai_endpoint=wm.openblox_config.get("openai_endpoint", ""),
+        ollama_endpoint=wm.openblox_config.get("ollama_endpoint", "http://localhost:11434"),
     )
 
 
@@ -158,6 +188,9 @@ async def get_config():
             "dev_mode": wm.openblox_config.get("dev_mode", False),
             "permissions_enabled": wm.openblox_config.get("permissions_enabled", True),
             "allowed_tools": wm.openblox_config.get("allowed_tools", []),
+            "provider": wm.openblox_config.get("provider", "kilo"),
+            "openai_endpoint": wm.openblox_config.get("openai_endpoint", ""),
+            "ollama_endpoint": wm.openblox_config.get("ollama_endpoint", "http://localhost:11434"),
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -190,6 +223,12 @@ async def save_config(cfg: ConfigUpdate):
             wm.openblox_config["permissions_enabled"] = cfg.permissions_enabled
         if cfg.allowed_tools is not None:
             wm.openblox_config["allowed_tools"] = cfg.allowed_tools
+        if cfg.provider is not None:
+            wm.openblox_config["provider"] = cfg.provider
+        if cfg.ollama_endpoint is not None:
+            wm.openblox_config["ollama_endpoint"] = cfg.ollama_endpoint
+        if cfg.openai_endpoint is not None:
+            wm.openblox_config["openai_endpoint"] = cfg.openai_endpoint
         wm.save()
         return {"ok": True}
     except Exception as e:
@@ -282,99 +321,6 @@ async def get_session(session_id: str):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    ai_client = make_client()
-    if not ai_client.is_configured():
-        return JSONResponse(status_code=400, content={"error": "API key not configured."})
-
-    session = None
-    if req.session_id:
-        for s in store.sessions:
-            if s.id == req.session_id:
-                session = s
-                break
-    if not session:
-        session = store.get_active()
-    if session.model:
-        ai_client.model = session.model
-
-    if req.edit_index is not None and 0 <= req.edit_index < len(session.messages):
-        session.messages = session.messages[:req.edit_index]
-        if req.message:
-            session.add_message("user", req.message)
-    elif req.message:
-        session.add_message("user", req.message)
-
-    if len(session.messages) == 1:
-        store.rename_session(session.id, req.message[:40] if req.message else "Chat")
-    store.save_session(session)
-
-    dev_chunks = []
-    doc_ctx = ""
-    if req.dev_mode:
-        dev_chunks = dev_proc.fetch_for_query(req.message or "")
-        if dev_chunks:
-            doc_ctx = dev_proc.build_context(dev_chunks)
-
-    history = [{"role": m.role, "content": m.content} for m in session.messages]
-
-    st = session.tools
-    tool_ctx = tools_mgr.get_enabled_context(st)
-    extra = tool_ctx if tool_ctx else ""
-
-    # Auto-compact if context >= 70%
-    if st.get("context_compactor", True) and session.context_pct() >= 70:
-        compact_note = _compact_session(session, ai_client)
-        history = [{"role": m.role, "content": m.content} for m in session.messages]
-        if compact_note:
-            extra += f"\n\n[Auto: {compact_note}]"
-
-    openai_tools = tools_mgr.get_openai_tools(st)
-    def _handler(name, args):
-        if name == "compact_context":
-            return _compact_session(session, ai_client) or "Context compacted."
-        return tools_mgr.handle_tool_call(name, args, st) if openai_tools else None
-    tool_handler = _handler if (openai_tools or st.get("context_compactor", True)) else None
-    advanced = st.get("advanced_thinking", False)
-    agent_context = ""
-    if st.get("roblox_studio_mcp", False):
-        agent_context = (
-            "Roblox Studio integration is ACTIVE and CONNECTED. "
-            "You MUST use the MCP tools to make ALL edits to the game. "
-            "NEVER output script code in chat — write every script directly to Studio via MCP. "
-            "Describe what you did in one plain sentence without showing code."
-        )
-    combined_extra = _compose_extra_context(extra, doc_ctx, agent_context)
-
-    if req.dev_mode and dev_chunks:
-        response = ai_client.chat_with_context(
-            history, doc_ctx, extra_context=_compose_extra_context(extra, "", agent_context),
-            tools=openai_tools or None, tool_handler=tool_handler,
-            advanced_thinking=advanced)
-    else:
-        response = ai_client.chat(
-            history, extra_context=combined_extra,
-            tools=openai_tools or None, tool_handler=tool_handler,
-            advanced_thinking=advanced)
-
-    if response is None:
-        response = "No response from API."
-
-    session.add_message("assistant", response)
-    store.save_session(session)
-
-    dev_out = []
-    if req.dev_mode:
-        dev_out = [
-            {"heading": c.heading_path or c.source_url, "text": c.text[:500]}
-            for c in dev_chunks[:5]
-        ]
-    return {
-        "response": response,
-        "session": session.to_dict(),
-        "dev_chunks": dev_out,
-    }
 
 
 
@@ -463,22 +409,22 @@ async def chat_stream(req: ChatRequest):
     if req.edit_index is not None and 0 <= req.edit_index < len(session.messages):
         session.messages = session.messages[:req.edit_index]
         if req.message:
-            session.add_message("user", req.message)
+            session.add_message("user", req.message, images=req.images)
     elif req.message:
-        session.add_message("user", req.message)
+        session.add_message("user", req.message, images=req.images)
 
     if len(session.messages) == 1:
         store.rename_session(session.id, req.message[:40] if req.message else "Chat")
     store.save_session(session)
 
-    history = [{"role": m.role, "content": m.content} for m in session.messages]
+    history = [_build_msg_dict(m) for m in session.messages]
     st = session.tools
     tool_ctx = tools_mgr.get_enabled_context(st)
     extra = tool_ctx if tool_ctx else ""
 
-    if st.get("context_compactor", True) and session.context_pct() >= 70:
+    if st.get("context_compactor", True) and session.context_pct() >= 50:
         compact_note = _compact_session(session, ai_client)
-        history = [{"role": m.role, "content": m.content} for m in session.messages]
+        history = [_build_msg_dict(m) for m in session.messages]
         if compact_note:
             extra += f"\n\n[Auto: {compact_note}]"
 
@@ -540,12 +486,9 @@ async def chat_stream(req: ChatRequest):
     advanced = st.get("advanced_thinking", False)
     integration_name = _get_integration_name(st)
 
-    dev_chunks = []
-    doc_ctx = ""
-    if req.dev_mode:
-        dev_chunks = dev_proc.fetch_for_query(req.message or "")
-        if dev_chunks:
-            doc_ctx = dev_proc.build_context(dev_chunks)
+    dev_chunks = dev_proc.fetch_for_query(req.message or "")
+    if dev_chunks:
+        doc_ctx = dev_proc.build_context(dev_chunks)
 
     def event_stream():
         nonlocal tool_handler
@@ -590,91 +533,88 @@ async def chat_stream(req: ChatRequest):
 
         if req.agent_mode:
             active_tool_names = [cfg["name"] for tid, cfg in tools_mgr.tool_defs.items() if st.get(tid, False)]
-            planner_plan = _build_agent_plan(ai_client, history, combined_extra, active_tool_names, req.max_subagents)
-            session.agent_plan = [{"text": step, "done": False} for step in planner_plan["main_steps"]]
-            store.save_session(session)
-            plan_event = {
-                "type": "agent_plan",
-                "plan": planner_plan,
-                "session_plan": session.agent_plan,
-            }
-            yield f"data: {json_mod.dumps(plan_event)}\n\n"
+            # Only build a new plan if there's no existing plan with undone steps
+            has_active_plan = any(not s.get("done") for s in session.agent_plan) if session.agent_plan else False
+            if not has_active_plan:
+                planner_plan = _build_agent_plan(ai_client, history, combined_extra, active_tool_names, req.max_subagents)
+                session.agent_plan = [{"text": step, "done": False} for step in planner_plan["main_steps"]]
+                store.save_session(session)
+                plan_event = {
+                    "type": "agent_plan",
+                    "plan": planner_plan,
+                    "session_plan": session.agent_plan,
+                }
+                yield f"data: {json_mod.dumps(plan_event)}\n\n"
 
-            subagent_notes = []
-            if planner_plan["use_subagents"]:
-                sub_list = planner_plan["subagents"][:min(req.max_subagents, 3)]
-                for index, subagent in enumerate(sub_list, start=1):
-                    status_event = {
-                        "type": "agent_status",
-                        "stage": "subagent_start",
-                        "agent": subagent["name"],
-                        "message": subagent["goal"],
-                    }
-                    yield f"data: {json_mod.dumps(status_event)}\n\n"
-                    sub_prompt = (
-                        f"You are subagent {index} in OpenBlox agent mode.\n"
-                        f"Focus only on this goal: {subagent['goal']}\n"
-                        "Return concise findings for the main agent. Do not address the user directly."
-                    )
-                    sub_history = list(history) + [{"role": "user", "content": sub_prompt}]
-                    note = subagent_client.chat(
-                        sub_history,
-                        max_tokens=1200,
-                        extra_context=combined_extra,
-                        tools=openai_tools or None if subagent.get("use_tools") else None,
-                        tool_handler=tool_handler if subagent.get("use_tools") else None,
-                        advanced_thinking=chain_thought,
-                    ) or ""
-                    subagent_notes.append(f"{subagent['name']}:\n{note}")
-                    session.agent_logs.append({
-                        "agent": subagent["name"],
-                        "stage": "subagent_done",
-                        "message": note[:400],
-                    })
-                    done_event = {
-                        "type": "agent_status",
-                        "stage": "subagent_done",
-                        "agent": subagent["name"],
-                        "message": note[:400],
-                    }
+                subagent_notes = []
+                if planner_plan["use_subagents"]:
+                    sub_list = planner_plan["subagents"][:min(req.max_subagents, 3)]
+                    for index, subagent in enumerate(sub_list, start=1):
+                        status_event = {
+                            "type": "agent_status",
+                            "stage": "subagent_start",
+                            "agent": subagent["name"],
+                            "message": subagent["goal"],
+                        }
+                        yield f"data: {json_mod.dumps(status_event)}\n\n"
+                        sub_prompt = (
+                            f"You are subagent {index} in OpenBlox agent mode.\n"
+                            f"Focus only on this goal: {subagent['goal']}\n"
+                            "Return concise findings for the main agent. Do not address the user directly."
+                        )
+                        sub_history = list(history) + [{"role": "user", "content": sub_prompt}]
+                        note = subagent_client.chat(
+                            sub_history,
+                            max_tokens=1200,
+                            extra_context=combined_extra,
+                            tools=openai_tools or None if subagent.get("use_tools") else None,
+                            tool_handler=tool_handler if subagent.get("use_tools") else None,
+                            advanced_thinking=chain_thought,
+                        ) or ""
+                        subagent_notes.append(f"{subagent['name']}:\n{note}")
+                        session.agent_logs.append({
+                            "agent": subagent["name"],
+                            "stage": "subagent_done",
+                            "message": note[:400],
+                        })
+                        done_event = {
+                            "type": "agent_status",
+                            "stage": "subagent_done",
+                            "agent": subagent["name"],
+                            "message": note[:400],
+                        }
                     yield f"data: {json_mod.dumps(done_event)}\n\n"
 
-            if planner_plan["use_subagents"] and subagent_notes:
-                combined_extra = _compose_extra_context(
-                    extra,
-                    doc_ctx,
-                    agent_context + "\n\nPlanner summary:\n"
-                    + planner_plan["summary"]
-                    + "\n\nSubagent notes:\n"
-                    + "\n\n".join(subagent_notes),
-                )
-            else:
-                combined_extra = _compose_extra_context(
-                    extra,
-                    doc_ctx,
-                    agent_context + "\n\nPlanner summary:\n" + planner_plan["summary"],
-                )
+                if planner_plan["use_subagents"] and subagent_notes:
+                    combined_extra = _compose_extra_context(
+                        extra,
+                        doc_ctx,
+                        agent_context + "\n\nPlanner summary:\n"
+                        + planner_plan["summary"]
+                        + "\n\nSubagent notes:\n"
+                        + "\n\n".join(subagent_notes),
+                    )
+                else:
+                    combined_extra = _compose_extra_context(
+                        extra,
+                        doc_ctx,
+                        agent_context + "\n\nPlanner summary:\n" + planner_plan["summary"],
+                    )
 
-            main_event = {
-                "type": "agent_status",
-                "stage": "main_agent",
-                "agent": "Main Agent",
-                "message": "Executing the final plan.",
-            }
-            yield f"data: {json_mod.dumps(main_event)}\n\n"
-            # Persist agent plan to logs
-            session.agent_logs = [{"agent": "Planner", "stage": "plan", "message": planner_plan.get("summary", "")}]
+                main_event = {
+                    "type": "agent_status",
+                    "stage": "main_agent",
+                    "agent": "Main Agent",
+                    "message": "Executing the final plan.",
+                }
+                yield f"data: {json_mod.dumps(main_event)}\n\n"
+                session.agent_logs = [{"agent": "Planner", "stage": "plan", "message": planner_plan.get("summary", "")}]
 
         # Chain-of-thought reasoning enhancement
         if chain_thought and req.agent_mode:
             reasoning_prompt = (
-                "Before responding, work through your reasoning step by step:\n"
-                "1. What does the user want?\n"
-                "2. What information do I have?\n"
-                "3. What approach should I use?\n"
-                "4. Execute the approach.\n"
-                "5. Verify the result.\n\n"
-                "Output your step-by-step reasoning, then provide the final answer."
+                "Reason through: intent → info → approach → execute → verify. "
+                "Then give final answer."
             )
             # Use a local copy to avoid shadowing the closure variable
             ctx_history = [dict(m) for m in history]
@@ -683,6 +623,8 @@ async def chat_stream(req: ChatRequest):
         else:
             ctx_history = history
 
+        final_content = ""
+        main_error = None
         for event in ai_client.chat_stream(
             ctx_history, extra_context=combined_extra,
             tools=openai_tools or None, tool_handler=tool_handler,
@@ -690,9 +632,16 @@ async def chat_stream(req: ChatRequest):
         ):
             if event["type"] == "done":
                 final_content = event["content"]
+            if event["type"] == "error":
+                main_error = event["content"]
             yield f"data: {json_mod.dumps(event)}\n\n"
 
-        session.add_message("assistant", final_content)
+        session.add_message("assistant", main_error or final_content)
+        if main_error:
+            store.save_session(session)
+            sess_event = {"type": "session", "session": session.to_dict()}
+            yield f"data: {json_mod.dumps(sess_event)}\n\n"
+            return
         # Auto-tick the first undone step after initial response
         if req.agent_mode and session.agent_plan:
             for step in session.agent_plan:
@@ -704,9 +653,9 @@ async def chat_stream(req: ChatRequest):
             yield f"data: {json_mod.dumps(plan_update)}\n\n"
         store.save_session(session)
 
-        # Multi-execution: keep executing until all steps done or max follow-ups reached
+        # Multi-execution: keep executing until all steps done or safety cap reached
         if req.agent_mode and session.agent_plan:
-            max_follow_ups = 1
+            max_follow_ups = 50  # effectively unlimited, safety cap against infinite loops
             follow_count = 0
             while follow_count < max_follow_ups:
                 undone = [s for s in session.agent_plan if not s.get("done")]
@@ -726,7 +675,9 @@ async def chat_stream(req: ChatRequest):
                 plan_update = {"type": "agent_plan_update", "session_plan": session.agent_plan}
                 yield f"data: {json_mod.dumps(plan_update)}\n\n"
                 session.add_message("user", follow_prompt)
-                exec_history = [{"role": m.role, "content": m.content} for m in session.messages]
+                exec_history = [_build_msg_dict(m) for m in session.messages]
+                final_content = ""
+                follow_error = None
                 for event in ai_client.chat_stream(
                     exec_history, extra_context=combined_extra,
                     tools=openai_tools or None, tool_handler=tool_handler,
@@ -734,7 +685,13 @@ async def chat_stream(req: ChatRequest):
                 ):
                     if event["type"] == "done":
                         final_content = event["content"]
+                    if event["type"] == "error":
+                        follow_error = event["content"]
                     yield f"data: {json_mod.dumps(event)}\n\n"
+                if follow_error:
+                    session.add_message("assistant", f"_Error: {follow_error}_")
+                    store.save_session(session)
+                    break
                 session.add_message("assistant", final_content)
                 store.save_session(session)
 
@@ -938,7 +895,37 @@ async def toggle_tool(req: ToolToggle):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@app.post("/api/upload")
+async def upload_image(file: UploadFile = File(...)):
+    try:
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            return JSONResponse(status_code=400, content={"error": f"Unsupported format. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"})
+        contents = await file.read()
+        if len(contents) > MAX_UPLOAD_SIZE:
+            return JSONResponse(status_code=400, content={"error": "File too large. Max 21MB."})
+        import uuid
+        name = f"{uuid.uuid4().hex[:12]}{ext}"
+        path = os.path.join(UPLOAD_DIR, name)
+        with open(path, "wb") as f:
+            f.write(contents)
+        return {"name": name}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.delete("/api/uploads/{name}")
+async def delete_upload(name: str):
+    try:
+        path = os.path.join(UPLOAD_DIR, name)
+        if os.path.isfile(path):
+            os.remove(path)
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
 # Suppress noisy Windows proactor connection reset errors

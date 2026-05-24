@@ -10,6 +10,8 @@ let _devState = { metrics: null };
 let _liveMsgEl = null;
 let _permReqId = null;
 let _permPollTimer = null;
+let _pendingImages = [];
+let _savedCustomEndpoint = '';
 const TIMEOUT_MS = 120000;
 
 const $ = s => document.querySelector(s);
@@ -289,6 +291,10 @@ async function init() {
       $('#s-model').value = cfg.model;
     }
     if (cfg.user_context) $('#s-context').value = cfg.user_context;
+    if (cfg.provider) {
+      const badge = document.getElementById('provider-badge');
+      if (badge) badge.textContent = _PROVIDER_LABELS[cfg.provider] || cfg.provider;
+    }
     if (cfg.dev_mode !== undefined) {
       const dEl = document.getElementById('s-dev-mode');
       if (dEl) dEl.checked = cfg.dev_mode;
@@ -297,9 +303,34 @@ async function init() {
     const ver = await api('/api/version').catch(() => ({ version: '' }));
     const vEl = document.getElementById('version-display');
     if (vEl && ver.version) vEl.textContent = 'v' + ver.version;
-  } catch (e) { toast('Failed to load: ' + e.message, 'err'); }
+    setupDragDrop();
+    hideSpinner();
+  } catch (e) { hideSpinner(); toast('Failed to load: ' + e.message, 'err'); }
 }
+
+function hideSpinner() {
+  const el = document.getElementById('loading-spinner');
+  if (el) el.classList.add('hidden');
+}
+const _PROVIDER_LABELS = {kilo:'Kilo',ollama:'Ollama',openai:'OpenAI',deepseek:'DeepSeek',openrouter:'OpenRouter',nvidia:'NVIDIA',groq:'Groq',together:'Together',fireworks:'Fireworks',mistral:'Mistral',xai:'xAI',perplexity:'Perplexity',cerebras:'Cerebras',sambanova:'SambaNova',deepinfra:'DeepInfra',novita:'Novita',minimax:'MiniMax',ai21:'AI21',moonshot:'Moonshot',dashscope:'DashScope',lmstudio:'LM Studio',vllm:'vLLM'};
+
 document.addEventListener('DOMContentLoaded', init);
+
+function setupDragDrop() {
+  const msgArea = document.getElementById('messages');
+  const dropOverlay = document.getElementById('drop-overlay');
+  if (!msgArea || !dropOverlay) return;
+
+  ['dragenter', 'dragover'].forEach(evt => {
+    msgArea.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); dropOverlay.classList.remove('hidden'); });
+  });
+  ['dragleave', 'drop'].forEach(evt => {
+    msgArea.addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); dropOverlay.classList.add('hidden'); });
+  });
+  msgArea.addEventListener('drop', e => {
+    if (e.dataTransfer.files.length) handleImageSelect(e.dataTransfer.files);
+  });
+}
 
 function populateModels(all) {
   const picker = $('#model-picker');
@@ -308,23 +339,16 @@ function populateModels(all) {
   const dev = (document.getElementById('s-dev-mode') || {}).checked || false;
   _ALL_MODELS.length = 0;
   _ALL_MODELS.push(...all);
-  picker.innerHTML = '';
-  sModel.innerHTML = '';
-  if (subModel && !subModel.options.length) {
-    subModel.innerHTML = '<option value="">Same as main</option>';
+
+  // Populate datalists
+  function fillDatalist(listId, options) {
+    const list = document.getElementById(listId);
+    if (!list) return;
+    list.innerHTML = options.map(m => `<option value="${esc(m.id)}">${esc(m.tier)}</option>`).join('');
   }
-  for (const m of all) {
-    const label = dev && m.id ? m.tier + ' \u2014 ' + m.id : m.tier;
-    const o1 = document.createElement('option');
-    o1.value = m.id; o1.textContent = label;
-    picker.appendChild(o1);
-    sModel.appendChild(o1.cloneNode(true));
-    if (subModel) {
-      const o2 = document.createElement('option');
-      o2.value = m.id; o2.textContent = m.tier + ' \u2014 ' + m.id;
-      subModel.appendChild(o2);
-    }
-  }
+  fillDatalist('model-list', all);
+  fillDatalist('s-model-list', all);
+  fillDatalist('s-subagent-model-list', all);
 }
 
 const MODEL_LABELS = {
@@ -554,6 +578,42 @@ function cancelEdit() {
 // ─── Chat ───
 let _sendTimer = null;
 
+function renderImagePreview() {
+  const el = document.getElementById('img-preview');
+  if (!el) return;
+  if (_pendingImages.length === 0) { el.innerHTML = ''; return; }
+  el.innerHTML = _pendingImages.map((img, i) =>
+    `<div class="thumb"><img src="${esc(img.url)}"><button class="remove-img" onclick="removeImage(${i})">&times;</button></div>`
+  ).join('') + '<div class="multimodal-warn">Note: most models cannot see images. Only a few multimodal models support vision.</div>';
+}
+
+function removeImage(idx) {
+  _pendingImages.splice(idx, 1);
+  renderImagePreview();
+}
+
+async function handleImageSelect(files) {
+  for (const f of files) {
+    if (!f.type.match(/^image\/(png|jpeg|gif|webp|bmp)$/)) continue;
+    if (f.size > 21 * 1024 * 1024) { toast('Image too large (max 21MB): ' + f.name, 'err'); continue; }
+    const fd = new FormData();
+    fd.append('file', f);
+    try {
+      const res = await fetch('/api/upload', { method: 'POST', body: fd });
+      const d = await res.json();
+      if (d.name) {
+        _pendingImages.push({ url: '/uploads/' + d.name, filename: d.name });
+      } else {
+        toast('Upload failed: ' + (d.error || 'unknown'), 'err');
+      }
+    } catch (e) {
+      toast('Upload error: ' + e.message, 'err');
+    }
+  }
+  renderImagePreview();
+  document.getElementById('img-input').value = '';
+}
+
 async function send() {
   const inp = document.getElementById('chat-input');
   const text = inp.value.trim();
@@ -591,14 +651,15 @@ async function send() {
     return;
   }
 
-  // Block sending if context is over 70%
-  if (_contextPct >= 70) {
+  // Emergency safety net — server auto-compacts at 50%
+  if (_contextPct >= 90) {
     showError('Context is ' + _contextPct + '% full. Type /compact to free up space before continuing.', 'warn');
     updateSendBtn();
     return;
   }
 
   inp.value = ''; inp.style.height = 'auto';
+  _pendingImages = []; renderImagePreview();
   sending = true;
   abortController = new AbortController();
   if (_agentMode) {
@@ -652,26 +713,42 @@ async function send() {
 
   const dev = (document.getElementById('s-dev-mode') || {}).checked || false;
   let timedOut = false;
-  _sendTimer = setTimeout(() => {
-    timedOut = true;
-    if (_thinkingTid) {
-      const el = document.getElementById('tf-status-' + _thinkingTid);
-      if (el) el.textContent = 'Still thinking...';
-    }
-    showError('Taking longer than expected...', 'warn');
+  const thinkPhases = [
+    { ms: TIMEOUT_MS, text: 'Still thinking...' },
+    { ms: TIMEOUT_MS + 60000, text: 'Still thinking, really' },
+    { ms: TIMEOUT_MS + 120000, text: 'Still thinking... I think?' },
+    { ms: TIMEOUT_MS + 180000, text: 'This is taking a while...' },
+  ];
+  thinkPhases.forEach(phase => {
     setTimeout(() => {
+      if (abortController?.signal.aborted) return;
       if (_thinkingTid) {
         const el = document.getElementById('tf-status-' + _thinkingTid);
-        if (el) el.textContent = 'Still thinking, really';
+        if (el) el.textContent = phase.text;
       }
-    }, 60000);
-  }, TIMEOUT_MS);
+      if (phase.ms === TIMEOUT_MS) showError('Taking longer than expected...', 'warn');
+    }, phase.ms);
+  });
 
   let accumulatedContent = '';
+  let pendingRender = false;
+  let pendingDelta = '';
+
+  function flushRender() {
+    pendingRender = false;
+    if (!pendingDelta) return;
+    const bodyEl = document.getElementById(liveMsgId + '-body');
+    if (bodyEl) {
+      bodyEl.innerHTML = fmt(accumulatedContent) + '<span class="stream-cursor"></span>';
+      scrollDown();
+    }
+    pendingDelta = '';
+  }
 
   try {
     const body = { message: text, session_id: curId, dev_mode: dev, agent_mode: _agentMode, subagent_model: _agentConfig.subagent_model, max_subagents: _agentConfig.max_subagents, chain_thought: _agentConfig.chain_thought };
     if (editIdx !== null) body.edit_index = editIdx;
+    if (_pendingImages.length > 0) body.images = _pendingImages.map(i => i.filename);
 
     const resp = await fetch('/api/chat/stream', {
       method: 'POST',
@@ -697,12 +774,11 @@ async function send() {
         try {
           const event = JSON.parse(line.slice(6));
           if (event.type === 'thinking') {
-            if (accumulatedContent) accumulatedContent += '\n\n';
-            accumulatedContent += event.content;
-            const bodyEl = document.getElementById(liveMsgId + '-body');
-            if (bodyEl) {
-              bodyEl.innerHTML = fmt(accumulatedContent) + '<span class="stream-cursor"></span>';
-              scrollDown();
+            accumulatedContent += (accumulatedContent ? '\n\n' : '') + event.content;
+            pendingDelta += (pendingDelta ? '\n\n' : '') + event.content;
+            if (!pendingRender) {
+              pendingRender = true;
+              requestAnimationFrame(flushRender);
             }
             addThinkStep('text', event.content.slice(0, 80));
           } else if (event.type === 'tool') {
@@ -1108,12 +1184,6 @@ function toggleDev() {
   const dev = cb ? cb.checked : false;
   if (!dev) hideDev();
   _devPanelOpen = dev;
-  [ $('#model-picker'), $('#s-model') ].forEach(sel => {
-    for (let i = 0; i < sel.options.length; i++) {
-      const m = _ALL_MODELS.find(x => x.id === sel.options[i].value);
-      if (m) sel.options[i].textContent = dev ? m.tier + ' \u2014 ' + m.id : m.tier;
-    }
-  });
 }
 
 // ─── Permission System ───
@@ -1236,22 +1306,14 @@ async function openSettings() {
       api('/api/config'),
       api('/api/models').catch(() => ({ models: [] })),
     ]);
-    if (!document.getElementById('s-model').options.length) populateModels(md.models || []);
+    if (!document.getElementById('s-model-list').children.length) populateModels(md.models || []);
     if (c.model) {
       document.getElementById('s-model').value = c.model;
       document.getElementById('model-picker').value = c.model;
     }
-    // Subagent model select (same models but separate)
-    const subSel = document.getElementById('s-subagent-model');
-    if (subSel && !subSel.options.length) {
-      subSel.innerHTML = '<option value="">Same as main</option>';
-      for (const m of md.models || []) {
-        const o = document.createElement('option');
-        o.value = m.id; o.textContent = m.tier + ' \u2014 ' + m.id;
-        subSel.appendChild(o);
-      }
+    if (c.subagent_model) {
+      document.getElementById('s-subagent-model').value = c.subagent_model;
     }
-    if (subSel && c.subagent_model) subSel.value = c.subagent_model;
 
     document.getElementById('s-temp').value = c.temperature;
     document.getElementById('s-temp-val').textContent = c.temperature;
@@ -1268,6 +1330,17 @@ async function openSettings() {
     // Dev mode
     const devEl = document.getElementById('s-dev-mode');
     if (devEl && c.dev_mode !== undefined) devEl.checked = c.dev_mode;
+    // Provider
+    const provEl = document.getElementById('s-provider');
+    if (provEl && c.provider) provEl.value = c.provider;
+    const apiKeyEl = document.getElementById('s-apikey');
+    if (apiKeyEl && c.api_key) apiKeyEl.value = c.api_key;
+    const ollamaEl = document.getElementById('s-ollama-endpoint');
+    if (ollamaEl && c.ollama_endpoint) ollamaEl.value = c.ollama_endpoint;
+    const openaiEl = document.getElementById('s-openai-endpoint');
+    // Preserve custom endpoint across provider changes — set before onProviderChange
+    _savedCustomEndpoint = c.openai_endpoint || '';
+    onProviderChange();
     // Permissions
     const permEl = document.getElementById('s-perm-enabled');
     if (permEl && c.permissions_enabled !== undefined) permEl.checked = c.permissions_enabled;
@@ -1304,6 +1377,7 @@ function switchTab(name) {
 function syncTemp(v) { document.getElementById('s-temp-val').textContent = v; }
 
 async function saveConf() {
+  const provider = document.getElementById('s-provider').value;
   const key = document.getElementById('s-apikey').value.trim();
   const model = document.getElementById('s-model').value.trim();
   const temp = parseFloat(document.getElementById('s-temp').value);
@@ -1315,7 +1389,9 @@ async function saveConf() {
   const chainThought = document.getElementById('s-chain-thought').checked;
   const devMode = document.getElementById('s-dev-mode').checked;
   const permEnabled = document.getElementById('s-perm-enabled').checked;
-  const body = { model, temperature: temp, max_chunks: chunks, chunk_size: size, subagent_model: subModel, max_subagents: maxSub, chain_thought: chainThought, dev_mode: devMode, permissions_enabled: permEnabled, allowed_tools: _allowedTools };
+  const ollamaEndpoint = document.getElementById('s-ollama-endpoint').value.trim();
+  const openaiEndpoint = document.getElementById('s-openai-endpoint').value.trim();
+  const body = { provider, model, temperature: temp, max_chunks: chunks, chunk_size: size, subagent_model: subModel, max_subagents: maxSub, chain_thought: chainThought, dev_mode: devMode, permissions_enabled: permEnabled, allowed_tools: _allowedTools, ollama_endpoint: ollamaEndpoint, openai_endpoint: openaiEndpoint };
   if (key) body.api_key = key;
   if (ctx !== undefined) body.user_context = ctx;
   await api('/api/config', { method: 'POST', body: JSON.stringify(body) });
@@ -1328,17 +1404,25 @@ async function saveConf() {
   const el = document.getElementById('s-save-status');
   el.textContent = 'Saved!';
   setTimeout(() => el.textContent = '', 2000);
+  // Update sidebar provider badge
+  const badge = document.getElementById('provider-badge');
+  if (badge) badge.textContent = _PROVIDER_LABELS[provider] || provider;
   toast('Settings saved', 'ok');
 }
 
 async function testConn() {
+  const provider = document.getElementById('s-provider').value;
   const key = document.getElementById('s-apikey').value.trim();
   const model = document.getElementById('s-model').value.trim();
+  const ollamaEndpoint = document.getElementById('s-ollama-endpoint').value.trim();
+  const openaiEndpoint = document.getElementById('s-openai-endpoint').value.trim();
   const el = document.getElementById('s-test-result');
-  if (!key) { el.textContent = 'Enter a key first'; return; }
+  if (provider !== 'ollama' && !key) { el.textContent = 'Enter a key first'; return; }
   el.textContent = 'Testing...';
   try {
-    await api('/api/config', { method: 'POST', body: JSON.stringify({ api_key: key, model }) });
+    const testBody = { model, provider, ollama_endpoint: ollamaEndpoint, openai_endpoint: openaiEndpoint };
+    if (key) testBody.api_key = key;
+    await api('/api/config', { method: 'POST', body: JSON.stringify(testBody) });
     const s = await api('/api/status');
     el.textContent = s.configured ? 'Connected!' : 'Failed';
     el.style.color = s.configured ? 'var(--cyan)' : '#ef4444';
@@ -1346,6 +1430,49 @@ async function testConn() {
     el.textContent = 'Error: ' + e.message;
     el.style.color = '#ef4444';
   }
+}
+
+const PROVIDER_ENDPOINTS = {
+  kilo: 'https://api.kilo.ai/api/gateway/chat/completions',
+  openai: 'https://api.openai.com/v1/chat/completions',
+  deepseek: 'https://api.deepseek.com/v1/chat/completions',
+  openrouter: 'https://openrouter.ai/api/v1/chat/completions',
+  nvidia: 'https://integrate.api.nvidia.com/v1/chat/completions',
+  groq: 'https://api.groq.com/openai/v1/chat/completions',
+  together: 'https://api.together.xyz/v1/chat/completions',
+  fireworks: 'https://api.fireworks.ai/inference/v1/chat/completions',
+  mistral: 'https://api.mistral.ai/v1/chat/completions',
+  xai: 'https://api.x.ai/v1/chat/completions',
+  perplexity: 'https://api.perplexity.ai/chat/completions',
+  cerebras: 'https://api.cerebras.ai/v1/chat/completions',
+  sambanova: 'https://api.sambanova.ai/v1/chat/completions',
+  deepinfra: 'https://api.deepinfra.com/v1/openai/chat/completions',
+  novita: 'https://api.novita.ai/v3/openai/chat/completions',
+  minimax: 'https://api.minimaxi.chat/v1/chat/completions',
+  ai21: 'https://api.ai21.com/studio/v1/chat/completions',
+  moonshot: 'https://api.moonshot.ai/v1/chat/completions',
+  dashscope: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
+  lmstudio: 'http://localhost:1234/v1/chat/completions',
+  vllm: 'http://localhost:8000/v1/chat/completions',
+};
+
+function onProviderChange() {
+  const provider = document.getElementById('s-provider').value;
+  document.getElementById('s-apikey-field').style.display = provider === 'ollama' ? 'none' : '';
+  document.getElementById('s-ollama-endpoint-field').style.display = provider === 'ollama' ? '' : 'none';
+  document.getElementById('s-openai-endpoint-field').style.display = provider === 'ollama' || provider === 'kilo' ? 'none' : '';
+  const epField = document.getElementById('s-openai-endpoint');
+  if (epField) {
+    epField.value = _savedCustomEndpoint || PROVIDER_ENDPOINTS[provider] || '';
+  }
+  api('/api/models').then(md => {
+    if (md.models && md.models.length) {
+      populateModels(md.models);
+      if (!document.getElementById('s-model').value) {
+        document.getElementById('s-model').value = md.models[0].id;
+      }
+    }
+  }).catch(() => {});
 }
 
 // ─── Utils ───

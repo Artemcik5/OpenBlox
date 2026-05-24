@@ -37,6 +37,9 @@ class WebsiteManager:
             "dev_mode": False,
             "permissions_enabled": True,
             "allowed_tools": [],
+            "provider": "kilo",
+            "openai_endpoint": "",
+            "ollama_endpoint": "http://localhost:11434",
         }
         self.search_config = {
             "max_chunks": 8,
