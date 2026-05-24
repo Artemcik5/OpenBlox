@@ -1492,7 +1492,7 @@ async function saveSetup() {
     if (ep) payload.openai_endpoint = ep;
   }
   try {
-    const res = await api('/api/config', { method: 'POST', body: payload });
+    const res = await api('/api/config', { method: 'POST', body: JSON.stringify(payload) });
     if (res.ok) {
       status.textContent = '';
       location.reload();
