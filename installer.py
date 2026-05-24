@@ -168,7 +168,29 @@ def install_from_zip(install_dir: str, log_fn) -> tuple[bool, str]:
 
     log_fn("Restoring config, chats, assets...")
     _restore_kept(install_dir, backup)
+    ok, msg = _install_deps(install_dir, log_fn)
+    if not ok:
+        return ok, msg
     return True, f"{count} files updated."
+
+
+def _install_deps(path: str, log_fn) -> tuple[bool, str]:
+    req = os.path.join(path, "requirements.txt")
+    if not os.path.isfile(req):
+        return True, "No requirements.txt"
+    log_fn("Installing dependencies...")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", req],
+            cwd=path, capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            return False, f"pip install failed:\n{result.stderr.strip()[:300]}"
+        return True, result.stdout.strip()[-200:] or "Dependencies installed."
+    except subprocess.TimeoutExpired:
+        return False, "pip install timed out"
+    except Exception as e:
+        return False, str(e)
 
 
 def install_with_git(path: str, log_fn) -> tuple[bool, str]:
@@ -198,6 +220,9 @@ def install_with_git(path: str, log_fn) -> tuple[bool, str]:
 
     log_fn("Restoring config, chats, assets...")
     _restore_kept(path, backup)
+    ok, msg = _install_deps(path, log_fn)
+    if not ok:
+        return ok, msg
     return True, "Update complete."
 
 
